@@ -1,0 +1,22 @@
+{
+  "summaries": [
+    {
+      "dataset": "mmlu-pro",
+      "split": "test",
+      "limit": 0.1,
+      "correct": 814,
+      "total": 1203,
+      "accuracy": 0.6766,
+      "std_err": 0.0135
+    },
+    {
+      "dataset": "mmlu",
+      "split": "test",
+      "limit": 0.1,
+      "correct": 1219,
+      "total": 1404,
+      "accuracy": 0.8682,
+      "std_err": 0.009
+    }
+  ]
+}

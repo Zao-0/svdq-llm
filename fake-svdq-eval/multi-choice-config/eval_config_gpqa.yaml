@@ -1,0 +1,35 @@
+model:
+  # One of: base, mpo, awq, test, next-base, next-mpo, ds-base, ds-mpo, bnb4, next-bnb4, ds-bnb4
+  tag: bnb4
+
+  # transformers device_map: "auto" | "cuda:0" | "cpu" | ...
+  device: cuda:1
+
+  # bfloat16 | float16 | float32
+  torch_dtype: bfloat16
+
+  trust_remote_code: true
+  tokenizer_padding_side: left
+
+gen:
+  batch_size: 8
+  max_new_tokens: 8192
+  temperature: 0
+  top_k: 0
+
+# Optional: input truncation length (tokenizer max_length).
+max_input_length: null
+
+# Whether to pass enable_thinking=True to apply_chat_template (if tokenizer supports it)
+thinking: false
+
+# Where to write outputs:
+#   - each dataset -> ${output_dir}/{name}_{split}.json
+#   - summary -> ${output_dir}/summary.json
+output_dir: ./multi-choice-result
+
+datasets:
+  - name: gpqa-diamond
+    split: train
+    limit: null
+    seed: 42

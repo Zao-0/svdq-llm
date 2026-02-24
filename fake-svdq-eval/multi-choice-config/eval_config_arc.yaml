@@ -1,0 +1,25 @@
+model:
+  tag: bnb4
+  device: cuda:2
+  torch_dtype: bfloat16
+  trust_remote_code: true
+  tokenizer_padding_side: left
+
+gen:
+  batch_size: 8
+  max_new_tokens: 2048
+  temperature: 1.1
+  top_k: 0
+
+output_dir: ./multi-choice-result
+thinking: true
+max_input_length: 4096
+
+datasets:
+  - name: arc-easy
+    split: validation      # 或 train / test
+    limit: 20
+
+  - name: arc-challenge
+    split: test
+    limit: 20

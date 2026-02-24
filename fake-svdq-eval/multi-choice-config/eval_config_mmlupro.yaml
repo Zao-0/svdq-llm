@@ -1,0 +1,49 @@
+# Example config for multi-choice-eval.py
+
+model:
+  # One of: base, mpo, awq, test, next-base, next-mpo, ds-base, ds-mpo, bnb4, next-bnb4, ds-bnb4
+  tag: rk64nvfp4
+
+  # transformers device_map: "auto" | "cuda:0" | "cpu" | ...
+  device: cuda:1
+
+  # bfloat16 | float16 | float32
+  torch_dtype: bfloat16
+
+  trust_remote_code: true
+  tokenizer_padding_side: left
+
+gen:
+  batch_size: 4
+  max_new_tokens: 8192
+  temperature: 1.1
+  top_k: 0
+
+# Optional: input truncation length (tokenizer max_length).
+# For long contexts (FinQA / ConvFinQA), consider setting this to your model's context window.
+max_input_length: null
+
+# Whether to pass enable_thinking=True to apply_chat_template (if tokenizer supports it)
+thinking: true
+
+# Where to write outputs:
+#   - each dataset -> ${output_dir}/{name}_{split}.json
+#   - summary -> ${output_dir}/summary.json
+output_dir: ./multi-choice-result
+
+# Evaluate one or multiple datasets in one run
+datasets:
+  - name: mmlu-pro
+    split: test
+    limit: 0.1   # int => first N; float in (0,1) => fraction
+    seed: 42
+
+  - name: mmlu
+    split: test
+    limit: 0.1
+    seed: 42
+  
+  # - name: gpqa-main
+  #   split: test
+  #   limit: null
+  #   seed: 42
