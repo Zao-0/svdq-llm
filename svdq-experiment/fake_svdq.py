@@ -1,29 +1,38 @@
-# fake_svdq_v2.py
 # -*- coding: utf-8 -*-
-"""fake_svdq_v2.py
+"""fake_svdq_v3.py
 
-Fake SVD-Quant (and MPO placeholder) for *_proj Linear weights.
+Fake SVD-Quant **and MPO-Quant** for *_proj Linear weights.
 
-This file extends the original `fake_svdq.py` with an **(no-calibration, no-forward)**
-weight reconstruction error scanner:
+What's new vs v2
+----------------
+1) Support `method: mpo` as a *high-precision side path* alternative to SVD:
 
-    stable_scanner(model, save_path, save_label)
+   - Compute a 2-core MPO (a.k.a. 2-site tensor-train) approximation `W_hat` where
+     `rank` is the virtual bond dimension.
+   - Quantize the residual `R = W - W_hat` (fake minifloat).
+   - Reconstruct `W' = W_hat + fake_quant(R)` and write back (same logic as your LoRA
+     "side path" idea, but using MPO).
 
-It enumerates all legal target linears:
+2) Remove the dependency on `torch.linalg.svd_lowrank` (some builds don't have it).
+   We use a version-compatible low-rank backend:
+     - exact SVD for small matrices
+     - torch.svd_lowrank when available
+     - randomized SVD fallback (Halko-style)
 
-    model.layers.{i}.{mlp|self_attn}.{*_proj}.weight
+Public API
+----------
+* `fake_op(model, svdq_config)`   : in-place weight replacement for allowlisted linears.
+* `stable_scanner(model, ...)`    : NMSE scan (no mutation) across schemes.
+* `fake_quantize(x, fmt, blk)`    : minifloat fake-quant kernel (shared with saver).
 
-and evaluates the **normalized mean-squared error (NMSE)** between reconstructed
-weights \tilde{W} and original W under a grid of (rank, quant_fmt, quant_blk)
-schemes **without mutating** the input model.
-
-Notes
------
-* `fake_op()` remains an in-place operator (same as v1).
-* `stable_scanner()` never writes back to `model`.
-* For practical scalability on large matrices, `stable_scanner()` uses randomized
-  truncated SVD (`torch.linalg.svd_lowrank`) by default; it will fall back to exact
-  SVD for small matrices.
+Config
+------
+`svdq_config` is a dict:
+{
+  "method": "svd" | "mpo",           # default: "svd"
+  "svd":   { ... ranks ... },         # ranks by layer (same format as v2)
+  "quant": { ... qspec ... },         # qspec by layer (same format as v2)
+}
 """
 
 from __future__ import annotations
@@ -52,6 +61,19 @@ _ALLOWED_PROJ = {
     ("mlp", "gate_proj"): "gate",
     ("mlp", "up_proj"): "up",
     ("mlp", "down_proj"): "down",
+}
+
+# Optional preferred 2-way factorizations for MPO reshape.
+# If a dim isn't present, we auto-factor it into (a,b) with a*b=dim and a≈sqrt(dim).
+_IN_DIM_HINTS: Dict[int, Tuple[int, int]] = {
+    1024: (32, 32),
+    4096: (64, 64),
+    12288: (96, 128),
+}
+_OUT_DIM_HINTS: Dict[int, Tuple[int, int]] = {
+    1024: (32, 32),
+    4096: (64, 64),
+    12288: (128, 96),
 }
 
 # module path: model.layers.{i}.{mlp|self_attn}.{proj}
@@ -143,12 +165,12 @@ def _resolve_quant_spec(
 def _resolve_method(svdq_config: Dict[str, Any]) -> str:
     m = svdq_config.get("method", None)
     if isinstance(m, str) and m:
-        return m.lower()
+        return m.lower().strip()
     svd = svdq_config.get("svd", {})
     if isinstance(svd, dict):
         m2 = svd.get("method", None)
         if isinstance(m2, str) and m2:
-            return m2.lower()
+            return m2.lower().strip()
     return "svd"
 
 
@@ -156,11 +178,12 @@ def _resolve_method(svdq_config: Dict[str, Any]) -> str:
 # Fake quantization kernels
 # ----------------------------
 
+
 def _em_for_fmt(fmt: str) -> Tuple[int, int]:
     fmt = fmt.lower()
     if fmt in ("fp4", "fp4_e2m1", "nvfp4", "mxfp4"):
         return 2, 1  # e2m1
-    if fmt in ("mxfp6","fp6"):
+    if fmt in ("mxfp6", "fp6"):
         return 3, 2  # e3m2
     if fmt in ("fp8",):
         return 4, 3  # e4m3
@@ -302,10 +325,14 @@ def fake_quantize(x: torch.Tensor, fmt: str, blk: Union[int, str], eps: float = 
 
 
 # ----------------------------
-# SVD / MPO (placeholder)
+# Low-rank backends (SVD / MPO)
 # ----------------------------
-def svd_lowrank(W: torch.Tensor, r: int) -> torch.Tensor:
+
+
+def _svd_lowrank_exact(W: torch.Tensor, r: int) -> torch.Tensor:
     """Exact truncated SVD low-rank approximation (float32)."""
+    if W.ndim != 2:
+        raise ValueError(f"SVD expects 2D matrix, got shape={tuple(W.shape)}")
     out, inp = W.shape
     r_eff = int(max(0, min(r, out, inp)))
     if r_eff == 0:
@@ -313,17 +340,10 @@ def svd_lowrank(W: torch.Tensor, r: int) -> torch.Tensor:
     if r_eff == min(out, inp):
         return W
     U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-    U_r = U[:, :r_eff]
-    S_r = S[:r_eff]
-    Vh_r = Vh[:r_eff, :]
-    return (U_r * S_r.unsqueeze(0)) @ Vh_r
+    return (U[:, :r_eff] * S[:r_eff].unsqueeze(0)) @ Vh[:r_eff, :]
 
 
-def mpo_lowrank_not_implemented(*args, **kwargs):
-    raise NotImplementedError("MPO decomposition is TODO (not implemented in fake_svdq_v2.py).")
-
-
-def _svd_lowrank_auto(
+def _svd_lowrank_auto_compat(
     W: torch.Tensor,
     r: int,
     *,
@@ -331,38 +351,155 @@ def _svd_lowrank_auto(
     niter: int = 2,
     exact_threshold: int = 2048,
 ) -> torch.Tensor:
-    """Truncated low-rank approximation used by `stable_scanner()`.
+    """Torch-version-compatible low-rank reconstruction (SVD).
 
-    - For small matrices (min_dim <= exact_threshold): exact SVD.
-    - Otherwise: randomized SVD (torch.linalg.svd_lowrank) with q=r+oversample.
+    Strategy:
+      1) exact `torch.linalg.svd` for small matrices
+      2) `torch.svd_lowrank` if available
+      3) randomized SVD (Halko) fallback
     """
-    out, inp = W.shape
-    r_eff = int(max(0, min(r, out, inp)))
-    if r_eff == 0:
+    r = int(max(0, r))
+    if r == 0:
         return torch.zeros_like(W)
-    if r_eff == min(out, inp):
-        return W
+    if W.ndim != 2:
+        raise ValueError(f"SVD expects 2D matrix, got shape={tuple(W.shape)}")
 
-    k = min(out, inp)
-    if k <= exact_threshold:
-        return svd_lowrank(W, r=r_eff)
+    m, n = W.shape
+    k = int(min(r, m, n))
+    if k == 0:
+        return torch.zeros_like(W)
+    if k >= min(m, n):
+        return W.clone()
 
-    # randomized
-    q = int(min(k, r_eff + max(0, int(oversample))))
-    # torch.linalg.svd_lowrank returns U:[out,q], S:[q], V:[inp,q]
-    U, S, V = torch.linalg.svd_lowrank(W, q=q, niter=int(max(0, niter)))
-    U_r = U[:, :r_eff]
-    S_r = S[:r_eff]
-    V_r = V[:, :r_eff]
-    return (U_r * S_r.unsqueeze(0)) @ V_r.transpose(0, 1)
+    if min(m, n) <= int(exact_threshold):
+        return _svd_lowrank_exact(W, r=k)
+
+    # Prefer torch.svd_lowrank if present.
+    if hasattr(torch, "svd_lowrank"):
+        try:
+            U, S, V = torch.svd_lowrank(W, q=k, niter=int(max(0, niter)))
+            return (U * S.unsqueeze(0)) @ V.transpose(0, 1)
+        except Exception:
+            pass
+
+    # Randomized SVD fallback.
+    q = int(min(n, k + max(0, int(oversample))))
+    Omega = torch.randn((n, q), device=W.device, dtype=W.dtype)
+    Y = W @ Omega
+    for _ in range(int(max(0, niter))):
+        Y = W @ (W.transpose(0, 1) @ Y)
+    Q, _ = torch.linalg.qr(Y, mode="reduced")
+    B = Q.transpose(0, 1) @ W
+    Ub, S, Vh = torch.linalg.svd(B, full_matrices=False)
+    U = Q @ Ub[:, :k]
+    return (U * S[:k].unsqueeze(0)) @ Vh[:k, :]
+
+
+def _factor2(n: int) -> Tuple[int, int]:
+    """Find (a,b) with a*b=n, a<=b, and a as close to sqrt(n) as possible."""
+    n = int(n)
+    if n <= 0:
+        raise ValueError(f"dim must be positive, got {n}")
+    r = int(n**0.5)
+    for a in range(r, 0, -1):
+        if n % a == 0:
+            b = n // a
+            return int(a), int(b)
+    return 1, n
+
+
+def _split_dim(n: int, hints: Dict[int, Tuple[int, int]]) -> Tuple[int, int]:
+    if int(n) in hints:
+        a, b = hints[int(n)]
+        if int(a) * int(b) == int(n):
+            return int(a), int(b)
+    return _factor2(int(n))
+
+
+def mpo_lowrank(
+    W: torch.Tensor,
+    r: int,
+    *,
+    out_factors: Optional[Tuple[int, int]] = None,
+    in_factors: Optional[Tuple[int, int]] = None,
+    svd_oversample: int = 8,
+    svd_niter: int = 2,
+    svd_exact_threshold: int = 2048,
+) -> torch.Tensor:
+    """2-core MPO approximation of a matrix.
+
+    We reshape W[out,in] -> W[o0,o1,i0,i1], then group (o0,i0) and (o1,i1) as a 2D matrix
+    and take a rank-r truncated SVD there. This corresponds to a bond-dimension-r MPO.
+    """
+    if W.ndim != 2:
+        raise ValueError(f"MPO expects 2D matrix, got shape={tuple(W.shape)}")
+    out, inp = map(int, W.shape)
+    r = int(max(0, min(r, out, inp)))
+    if r == 0:
+        return torch.zeros_like(W)
+    if r >= min(out, inp):
+        return W.clone()
+
+    o0, o1 = out_factors if out_factors is not None else _split_dim(out, _OUT_DIM_HINTS)
+    i0, i1 = in_factors if in_factors is not None else _split_dim(inp, _IN_DIM_HINTS)
+    if o0 * o1 != out or i0 * i1 != inp:
+        raise ValueError(
+            f"Bad MPO factors: out={out} -> ({o0},{o1}), in={inp} -> ({i0},{i1})"
+        )
+
+    # W[o0,o1,i0,i1] -> permute to [o0,i0,o1,i1] -> view as [o0*i0, o1*i1]
+    W4 = W.contiguous().view(o0, o1, i0, i1)
+    W2 = W4.permute(0, 2, 1, 3).contiguous().view(o0 * i0, o1 * i1)
+
+    W2_hat = _svd_lowrank_auto_compat(
+        W2,
+        r=r,
+        oversample=int(svd_oversample),
+        niter=int(svd_niter),
+        exact_threshold=int(svd_exact_threshold),
+    )
+
+    W4_hat = W2_hat.view(o0, i0, o1, i1).permute(0, 2, 1, 3).contiguous()
+    return W4_hat.view(out, inp)
+
+
+def _lowrank(
+    W: torch.Tensor,
+    r: int,
+    method: str,
+    *,
+    svd_oversample: int = 8,
+    svd_niter: int = 2,
+    svd_exact_threshold: int = 2048,
+) -> torch.Tensor:
+    method = (method or "svd").lower().strip()
+    if method == "svd":
+        return _svd_lowrank_auto_compat(
+            W,
+            r=r,
+            oversample=svd_oversample,
+            niter=svd_niter,
+            exact_threshold=svd_exact_threshold,
+        )
+    if method == "mpo":
+        return mpo_lowrank(
+            W,
+            r=r,
+            svd_oversample=svd_oversample,
+            svd_niter=svd_niter,
+            svd_exact_threshold=svd_exact_threshold,
+        )
+    raise ValueError(f"Unknown method: {method!r} (expected 'svd' or 'mpo')")
 
 
 # ----------------------------
 # Main public API (in-place)
 # ----------------------------
+
+
 @torch.no_grad()
 def fake_op(model: nn.Module, svdq_config: Dict[str, Any]) -> nn.Module:
-    """Apply fake SVD+quant reconstruction to selected *_proj weights in-place."""
+    """Apply fake (low-rank + quant residual) reconstruction to selected *_proj weights in-place."""
     if not isinstance(svdq_config, dict):
         raise TypeError("svdq_config must be a dict")
 
@@ -370,10 +507,17 @@ def fake_op(model: nn.Module, svdq_config: Dict[str, Any]) -> nn.Module:
     quant_dict = svdq_config.get("quant", {}) or {}
     method = _resolve_method(svdq_config)
 
-    if method == "mpo":
-        mpo_lowrank_not_implemented()
-    if method != "svd":
-        raise ValueError(f"Unknown decomposition method: {method!r} (expected 'svd' or 'mpo')")
+    # Optional low-rank backend knobs
+    lr_cfg = svdq_config.get("lowrank", None)
+    if lr_cfg is None:
+        lr_cfg = svdq_config.get("svd_cfg", None)
+    if lr_cfg is None:
+        lr_cfg = svdq_config.get("svd", {}) if isinstance(svdq_config.get("svd", {}), dict) else {}
+    lr_cfg = lr_cfg or {}
+
+    oversample = int(lr_cfg.get("oversample", 8))
+    niter = int(lr_cfg.get("niter", 2))
+    exact_threshold = int(lr_cfg.get("exact_threshold", 2048))
 
     targets = _iter_allowed_linears(model)
 
@@ -394,13 +538,27 @@ def fake_op(model: nn.Module, svdq_config: Dict[str, Any]) -> nn.Module:
             fmt, blk = qspec
             W_hat = fake_quantize(W, fmt=fmt, blk=blk, eps=1e-6)
         elif rank is not None and qspec is None:
-            W_hat = svd_lowrank(W, r=int(rank))
+            W_hat = _lowrank(
+                W,
+                r=int(rank),
+                method=method,
+                svd_oversample=oversample,
+                svd_niter=niter,
+                svd_exact_threshold=exact_threshold,
+            )
         else:
             fmt, blk = qspec  # type: ignore[misc]
-            L = svd_lowrank(W, r=int(rank))  # type: ignore[arg-type]
-            R = W - L
+            W_side = _lowrank(
+                W,
+                r=int(rank),
+                method=method,
+                svd_oversample=oversample,
+                svd_niter=niter,
+                svd_exact_threshold=exact_threshold,
+            )
+            R = W - W_side
             Rq = fake_quantize(R, fmt=fmt, blk=blk, eps=1e-6)
-            W_hat = L + Rq
+            W_hat = W_side + Rq
 
         mod.weight.data = W_hat.to(device=dev0, dtype=dtype0)
 
@@ -411,12 +569,15 @@ def fake_op(model: nn.Module, svdq_config: Dict[str, Any]) -> nn.Module:
 # Stable scanner (no mutation)
 # ----------------------------
 
+
 @dataclass(frozen=True)
 class ScanScheme:
     """One evaluation scheme."""
+
     rank: Optional[int] = None
     quant_fmt: Optional[str] = None
     quant_blk: Optional[Union[int, str]] = None
+    method: str = "svd"  # "svd" | "mpo"
 
     @property
     def mode(self) -> str:
@@ -425,12 +586,13 @@ class ScanScheme:
         if self.rank is None and self.quant_fmt is not None:
             return "quant_only"
         if self.rank is not None and self.quant_fmt is None:
-            return "svd_only"
-        return "svd_plus_quant"
+            return "lowrank_only"
+        return "lowrank_plus_quant"
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "mode": self.mode,
+            "method": self.method,
             "rank": self.rank,
             "quant": None
             if self.quant_fmt is None
@@ -466,33 +628,32 @@ def _reconstruct_weight_for_scheme(
     if scheme.mode == "quant_only":
         return fake_quantize(W, fmt=str(scheme.quant_fmt), blk=scheme.quant_blk, eps=eps)
 
-    if scheme.mode == "svd_only":
-        return _svd_lowrank_auto(
+    if scheme.mode == "lowrank_only":
+        return _lowrank(
             W,
             r=int(scheme.rank or 0),
-            oversample=svd_oversample,
-            niter=svd_niter,
-            exact_threshold=svd_exact_threshold,
+            method=str(scheme.method),
+            svd_oversample=svd_oversample,
+            svd_niter=svd_niter,
+            svd_exact_threshold=svd_exact_threshold,
         )
 
-    # svd + quant residual
-    L = _svd_lowrank_auto(
+    # lowrank + quant residual
+    L = _lowrank(
         W,
         r=int(scheme.rank or 0),
-        oversample=svd_oversample,
-        niter=svd_niter,
-        exact_threshold=svd_exact_threshold,
+        method=str(scheme.method),
+        svd_oversample=svd_oversample,
+        svd_niter=svd_niter,
+        svd_exact_threshold=svd_exact_threshold,
     )
     R = W - L
     Rq = fake_quantize(R, fmt=str(scheme.quant_fmt), blk=scheme.quant_blk, eps=eps)
     return L + Rq
 
 
-def _default_scan_schemes() -> List[ScanScheme]:
-    """Default grid: moderate size, focuses on practical candidates.
-
-    You can override these by editing this function locally.
-    """
+def _default_scan_schemes(method: str = "svd") -> List[ScanScheme]:
+    """Default grid: moderate size, focuses on practical candidates."""
     ranks = [8, 16, 32, 64]
     quant_specs: List[Tuple[str, Union[int, str]]] = [
         ("fp4", "in"),
@@ -506,20 +667,21 @@ def _default_scan_schemes() -> List[ScanScheme]:
         ("fp8", 128),
     ]
 
+    method = (method or "svd").lower().strip()
     schemes: List[ScanScheme] = []
 
     # quant-only
     for fmt, blk in quant_specs:
-        schemes.append(ScanScheme(rank=None, quant_fmt=fmt, quant_blk=blk))
+        schemes.append(ScanScheme(rank=None, quant_fmt=fmt, quant_blk=blk, method=method))
 
-    # svd-only
+    # lowrank-only
     for r in ranks:
-        schemes.append(ScanScheme(rank=int(r), quant_fmt=None, quant_blk=None))
+        schemes.append(ScanScheme(rank=int(r), quant_fmt=None, quant_blk=None, method=method))
 
-    # svd + quant
+    # lowrank + quant
     for r in ranks:
         for fmt, blk in quant_specs:
-            schemes.append(ScanScheme(rank=int(r), quant_fmt=fmt, quant_blk=blk))
+            schemes.append(ScanScheme(rank=int(r), quant_fmt=fmt, quant_blk=blk, method=method))
 
     return schemes
 
@@ -528,21 +690,20 @@ def _default_scan_schemes() -> List[ScanScheme]:
 def stable_scanner(model: nn.Module, save_path: str, save_label: str) -> Dict[str, Any]:
     """Scan all target linears and evaluate NMSE under a grid of schemes.
 
-    Requirements from user:
-    - find all legal linears to fake-quantize
-    - compare errors before/after under different quant schemes
-    - DO NOT register modifications back to the original model
-    - save to {save_path}/{save_label}.json
+    Environment controls:
+      - FAKE_SVDQ_SCAN_DEVICE=cpu|cuda
+      - FAKE_SVDQ_SCAN_METHOD=svd|mpo
     """
     t0 = time.time()
     Path(save_path).mkdir(parents=True, exist_ok=True)
     out_file = Path(save_path) / f"{save_label}.json"
 
     targets = _iter_allowed_linears(model)
-    schemes = _default_scan_schemes()
+
+    env_method = os.environ.get("FAKE_SVDQ_SCAN_METHOD", "").strip().lower() or "svd"
+    schemes = _default_scan_schemes(method=env_method)
 
     # Choose computation device heuristic (can override by env var)
-    #   FAKE_SVDQ_SCAN_DEVICE=cpu|cuda
     env_dev = os.environ.get("FAKE_SVDQ_SCAN_DEVICE", "").strip().lower()
 
     results: Dict[str, Any] = {
@@ -554,11 +715,11 @@ def stable_scanner(model: nn.Module, save_path: str, save_label: str) -> Dict[st
             "num_schemes": len(schemes),
             "scheme_preview": [s.as_dict() for s in schemes[: min(8, len(schemes))]],
             "scan_device_env": env_dev or None,
+            "scan_method_env": env_method,
         },
         "targets": {},
     }
 
-    # Iterate
     names = sorted(targets.keys())
     for idx, name in enumerate(names):
         mod = targets[name]
@@ -568,11 +729,9 @@ def stable_scanner(model: nn.Module, save_path: str, save_label: str) -> Dict[st
         dev0 = str(W0.device)
         shape = list(W0.shape)
 
-        # Decide compute device
         if env_dev in ("cpu", "cuda"):
             compute_device = torch.device(env_dev if env_dev == "cpu" else ("cuda" if torch.cuda.is_available() else "cpu"))
         else:
-            # default: keep on original device
             compute_device = W0.device
 
         entry: Dict[str, Any] = {
@@ -588,25 +747,16 @@ def stable_scanner(model: nn.Module, save_path: str, save_label: str) -> Dict[st
 
         try:
             W = W0.to(device=compute_device, dtype=torch.float32, non_blocking=True)
-            # also store noop baseline (nmse=0)
             for s in schemes:
                 try:
                     W_hat = _reconstruct_weight_for_scheme(W, s)
-                    entry["nmse"].append({
-                        **s.as_dict(),
-                        "value": _nmse(W_hat, W),
-                    })
+                    entry["nmse"].append({**s.as_dict(), "value": _nmse(W_hat, W)})
                 except Exception as e:
-                    entry["nmse"].append({
-                        **s.as_dict(),
-                        "error": f"{type(e).__name__}: {e}",
-                    })
+                    entry["nmse"].append({**s.as_dict(), "error": f"{type(e).__name__}: {e}"})
 
-            # a small summary: best configs (by nmse)
             ok = [r for r in entry["nmse"] if "value" in r]
             ok_sorted = sorted(ok, key=lambda d: d["value"])
             entry["best"] = ok_sorted[: min(10, len(ok_sorted))]
-
         except Exception as e:
             entry["error"] = f"{type(e).__name__}: {e}"
 
@@ -615,14 +765,12 @@ def stable_scanner(model: nn.Module, save_path: str, save_label: str) -> Dict[st
         if (idx + 1) % 10 == 0 or (idx + 1) == len(names):
             print(f"[stable_scanner] {idx+1}/{len(names)} done: {name}")
 
-        # free per-layer intermediates (best-effort)
         if torch.cuda.is_available() and compute_device.type == "cuda":
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
     results["meta"]["elapsed_sec"] = float(time.time() - t0)
 
-    # write json
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
@@ -633,6 +781,7 @@ def stable_scanner(model: nn.Module, save_path: str, save_label: str) -> Dict[st
 # ----------------------------
 # CLI demo
 # ----------------------------
+
 
 def _load_hf_model(model_path: str, device: str, dtype: str) -> nn.Module:
     try:
@@ -663,7 +812,7 @@ def _load_hf_model(model_path: str, device: str, dtype: str) -> nn.Module:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fake SVDQ stable scanner (NMSE, no calibration, no forward)")
+    parser = argparse.ArgumentParser(description="Fake SVDQ/MPO stable scanner (NMSE, no calibration, no forward)")
     parser.add_argument("--model_path", type=str, default="", help="HF checkpoint path (AutoModelForCausalLM)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bf16", help="bf16/fp16/fp32/auto")

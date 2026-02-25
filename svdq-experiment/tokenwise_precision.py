@@ -1,13 +1,13 @@
-# tokenwise_precision.py
+# tokenwise_precision_v5.py
 # -*- coding: utf-8 -*-
-"""Tokenwise precision / forward-output error evaluation for Fake SVD-Quant.
+"""Tokenwise precision / forward-output error evaluation for Fake SVD-Quant / MPO-Quant (with NVFP4/MX microscaling simulation).
 
 This script implements three functions the user requested:
 
 1) save_ori_XY(model, save_path, label)
    - Build representative inputs via get_veri_data(seed, cn=50, eu=80, len=128)
-   - Run ONE forward pass over these inputs and capture X/Y of allowlisted *_proj linears
-   - Save to {save_path}/{label}.safetensors (or .pt fallback)
+   - Run forward passes and capture X/Y of allowlisted *_proj linears (layer-by-layer to control CPU RAM)
+   - Save to {save_path}/{label}_{layer_idx}.safetensors (or .pt fallback), one file per layer
      keys are "{mod_name}.X" and "{mod_name}.Y"
 
 2) eval_tokenwise_fake(model, xy_path, out_json_path, ...)
@@ -23,7 +23,7 @@ Notes
 -----
 * This file assumes your repo provides:
     - data_gen.get_veri_data
-    - fake_svdq.fake_op
+    - fake_svdq_v3.fake_op (supports method=svd|mpo; falls back to fake_svdq.fake_op if needed)
     - smooth_util.load_smoothed_model (optional; only for "eval_smooth" CLI)
 * We do NOT run full end-to-end forward for every config. We only do X@W^T.
 """
@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import gc
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -135,6 +136,74 @@ def load_tensor_dict(path: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, str]
         return dict(obj), {}
     raise TypeError(f"Unsupported file content: {type(obj)}")
 
+_LAYER_FILE_RE = re.compile(r"^(?P<prefix>.*)_(?P<layer>\d+)\.(?P<ext>safetensors|pt)$")
+
+
+def _collect_layer_xy_files(xy_path: str) -> Dict[int, str]:
+    """Return {layer_idx: filepath} from a directory that contains per-layer XY files.
+
+    Expected filename pattern: '{label}_{layer_idx}.safetensors' (label may contain underscores).
+    """
+    if not os.path.isdir(xy_path):
+        raise ValueError(f"xy_path is not a directory: {xy_path}")
+    out: Dict[int, str] = {}
+    for fn in os.listdir(xy_path):
+        m = _LAYER_FILE_RE.match(fn)
+        if not m:
+            continue
+        layer = int(m.group("layer"))
+        out[layer] = os.path.join(xy_path, fn)
+    return dict(sorted(out.items(), key=lambda kv: kv[0]))
+
+
+def _safetensors_safe_open():
+    try:
+        from safetensors.torch import safe_open  # type: ignore
+
+        return safe_open
+    except Exception:
+        return None
+
+
+class _XYLayerReader:
+    """Lightweight reader for a single per-layer XY file."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._safe_open = _safetensors_safe_open()
+        self._ctx = None
+        self._keys = None
+
+    def __enter__(self):
+        if self.path.endswith(".safetensors") and self._safe_open is not None:
+            self._ctx = self._safe_open(self.path, framework="pt", device="cpu")
+            self._keys = set(self._ctx.keys())
+        else:
+            td, _meta = load_tensor_dict(self.path)
+            self._ctx = td
+            self._keys = set(td.keys())
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # safetensors safe_open returns a context manager that needs close
+        try:
+            if hasattr(self._ctx, "__exit__"):
+                self._ctx.__exit__(exc_type, exc, tb)  # type: ignore
+        finally:
+            self._ctx = None
+            self._keys = None
+
+    def has(self, key: str) -> bool:
+        return key in (self._keys or set())
+
+    def get(self, key: str) -> torch.Tensor:
+        if self._ctx is None:
+            raise RuntimeError("Reader not opened")
+        if isinstance(self._ctx, dict):
+            return self._ctx[key]
+        return self._ctx.get_tensor(key)  # type: ignore
+
+
 
 # ----------------------------
 # Representative inputs
@@ -213,10 +282,15 @@ def save_ori_XY(
 ) -> str:
     """Capture (X,Y) for each allowlisted linear across representative inputs and save.
 
-    Returns the written file path.
+    To avoid exploding CPU RAM, we save **one file per layer**:
+        {save_path}/{label}_{layer_idx}.safetensors
+
+    Keys inside each file are still:
+        "{mod_name}.X" and "{mod_name}.Y"
+
+    Returns the output directory (save_path).
     """
 
-    # try to infer tokenizer if user attached it to model; else, user should use CLI.
     tok = getattr(model, "tokenizer", None)
     if tok is None:
         raise RuntimeError(
@@ -230,55 +304,22 @@ def save_ori_XY(
     if not targets:
         raise RuntimeError("No target linears found. Check model structure or allowlist regex.")
 
-    # storage lists per module
-    xs: Dict[str, List[torch.Tensor]] = {name: [] for name in targets}
-    ys: Dict[str, List[torch.Tensor]] = {name: [] for name in targets}
+    # group targets by layer
+    layer_to_targets: Dict[int, Dict[str, nn.Module]] = {}
+    for name, mod in targets.items():
+        layer, _block, _proj = _name_to_layer_block_proj(name)
+        layer_to_targets.setdefault(layer, {})[name] = mod
 
     if save_dtype.lower() == "fp32":
         out_dtype = torch.float32
     else:
         out_dtype = torch.bfloat16
 
-    hooks = []
+    st_load, st_save = _try_import_safetensors()
+    use_st = st_save is not None
+    ext = "safetensors" if use_st else "pt"
 
-    def _make_hook(mod_name: str):
-        def _hook(_mod: nn.Module, inp: Tuple[torch.Tensor, ...], out: torch.Tensor):
-            x = inp[0].detach()
-            y = out.detach()
-            # move to cpu for saving
-            if isinstance(x, torch.Tensor) and x.ndim == 3:
-                x = x.reshape(-1, x.shape[-1])
-            if isinstance(y, torch.Tensor) and y.ndim == 3:
-                y = y.reshape(-1, y.shape[-1])
-
-            xs[mod_name].append(x.to("cpu", dtype=out_dtype, non_blocking=True))
-            ys[mod_name].append(y.to("cpu", dtype=out_dtype, non_blocking=True))
-
-        return _hook
-
-    for name, mod in targets.items():
-        hooks.append(mod.register_forward_hook(_make_hook(name)))
-
-    # run forward over representative inputs (batch=1 each)
-    pad_id = getattr(tok, "pad_token_id", None)
-    for input_ids in build_veri_inputs(tok, veri_cfg):
-        if input_ids.ndim == 1:
-            input_ids = input_ids.unsqueeze(0)
-        input_ids = input_ids.to(device_in)
-        attn = _build_attention_mask(input_ids, pad_id if pad_id is not None else -1).to(device_in)
-        _ = model(input_ids=input_ids, attention_mask=attn, use_cache=use_cache)
-
-    for h in hooks:
-        h.remove()
-
-    # concat per module
-    tensor_dict: Dict[str, torch.Tensor] = {}
-    for name in targets.keys():
-        if xs[name]:
-            X = torch.cat(xs[name], dim=0)
-            Y = torch.cat(ys[name], dim=0)
-            tensor_dict[f"{name}.X"] = X
-            tensor_dict[f"{name}.Y"] = Y
+    os.makedirs(save_path, exist_ok=True)
 
     meta = {
         "seed": str(veri_cfg.seed),
@@ -286,15 +327,76 @@ def save_ori_XY(
         "eu": str(veri_cfg.eu),
         "length": str(veri_cfg.length),
         "save_dtype": save_dtype,
+        "layout": "per_layer",
+        "key_format": "{mod_name}.X/.Y",
     }
 
-    out_file = os.path.join(save_path, f"{label}.safetensors")
-    # If safetensors isn't available, save_tensor_dict will fall back to torch.save
-    if _try_import_safetensors()[1] is None:
-        out_file = os.path.join(save_path, f"{label}.pt")
+    pad_id = getattr(tok, "pad_token_id", None)
+    veri_inputs = build_veri_inputs(tok, veri_cfg)
 
-    save_tensor_dict(out_file, tensor_dict, metadata=meta)
-    return out_file
+    # Iterate layers, run forward passes with hooks only on this layer.
+    for layer_idx in sorted(layer_to_targets.keys()):
+        layer_targets = layer_to_targets[layer_idx]
+        if not layer_targets:
+            continue
+
+        xs: Dict[str, List[torch.Tensor]] = {name: [] for name in layer_targets}
+        ys: Dict[str, List[torch.Tensor]] = {name: [] for name in layer_targets}
+
+        hooks = []
+
+        def _make_hook(mod_name: str):
+            def _hook(_mod: nn.Module, inp: Tuple[torch.Tensor, ...], out: torch.Tensor):
+                x = inp[0].detach()
+                y = out.detach()
+
+                if isinstance(x, torch.Tensor) and x.ndim == 3:
+                    x = x.reshape(-1, x.shape[-1])
+                if isinstance(y, torch.Tensor) and y.ndim == 3:
+                    y = y.reshape(-1, y.shape[-1])
+
+                xs[mod_name].append(x.to("cpu", dtype=out_dtype, non_blocking=True))
+                ys[mod_name].append(y.to("cpu", dtype=out_dtype, non_blocking=True))
+
+            return _hook
+
+        for name, mod in layer_targets.items():
+            hooks.append(mod.register_forward_hook(_make_hook(name)))
+
+        with torch.no_grad():
+            for input_ids in veri_inputs:
+                if input_ids.ndim == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                input_ids = input_ids.to(device_in)
+                attn = _build_attention_mask(input_ids, pad_id if pad_id is not None else -1).to(device_in)
+                _ = model(input_ids=input_ids, attention_mask=attn, use_cache=use_cache)
+
+        for h in hooks:
+            h.remove()
+
+        # concat per module and save this layer
+        tensor_dict: Dict[str, torch.Tensor] = {}
+        for name in layer_targets.keys():
+            if not xs[name]:
+                continue
+            X = torch.cat(xs[name], dim=0)
+            Y = torch.cat(ys[name], dim=0)
+            tensor_dict[f"{name}.X"] = X
+            tensor_dict[f"{name}.Y"] = Y
+
+        out_file = os.path.join(save_path, f"{label}_{layer_idx}.{ext}")
+        save_tensor_dict(out_file, tensor_dict, metadata=meta)
+
+        # aggressively free CPU RAM
+        del tensor_dict, xs, ys, hooks
+        gc.collect()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    return save_path
 
 
 # ----------------------------
@@ -319,6 +421,7 @@ def tokenwise_metrics(
     Y: torch.Tensor,
     W: torch.Tensor,
     b: Optional[torch.Tensor] = None,
+    smooth_factor: Optional[torch.Tensor] = None,
     *,
     device: Optional[torch.device] = None,
     chunk_tokens: int = 4096,
@@ -371,15 +474,28 @@ def tokenwise_metrics(
 
     # Preprocess bias once (avoid repeated device transfers).
     bd_dev: Optional[torch.Tensor] = None
+
     if b is not None:
         bd = b.detach()
         if bd.ndim != 1:
             bd = bd.view(-1)
         bd_dev = bd.to(dev, dtype=torch.float32)
 
+    sf_dev: Optional[torch.Tensor] = None
+    if smooth_factor is not None:
+        sf = smooth_factor.detach()
+        if sf.ndim == 0:
+            sf_dev = sf.to(dev, dtype=torch.float32)
+        elif sf.ndim == 1:
+            sf_dev = sf.to(dev, dtype=torch.float32).view(1, -1)
+        else:
+            raise ValueError(f"Unsupported smooth_factor shape: {tuple(sf.shape)}")
+
     for i0 in range(0, n_tok, chunk_tokens):
         i1 = min(i0 + chunk_tokens, n_tok)
         Xc = Xf[i0:i1].to(dev, dtype=torch.float32)
+        if sf_dev is not None:
+            Xc = Xc / sf_dev
         Yc = Yf[i0:i1].to(dev, dtype=torch.float32)
 
         Yh = Xc @ Wd.t()
@@ -441,23 +557,46 @@ def _parse_int_list(s: str) -> List[int]:
 
 
 def _parse_qspec_list(s: str) -> List[Tuple[str, Union[int, str]]]:
-    """Parse "nvfp4@128,fp4@in" -> [("nvfp4",128),("fp4","in")]"""
+    """Parse qspec list.
+
+    Rules
+    -----
+    * Legacy formats (fp4/fp6/fp8/...) REQUIRE an explicit "@blk":
+        - "fp4@in", "fp4@out", "fp4@128"
+    * Microscaling formats IGNORE blk (but we still accept any suffix for robustness):
+        - "nvfp4@128" / "mxfp4@out" / "mxfp6@999"  -> blk is canonicalized to "na"
+      You may also pass them without "@...": "nvfp4" -> ("nvfp4","na")
+    """
     out: List[Tuple[str, Union[int, str]]] = []
     if not s.strip():
         return out
+
+    ignore_blk_fmts = {"nvfp4", "mxfp4", "mxfp6"}
+
     for item in s.split(","):
         item = item.strip()
         if not item:
             continue
-        if "@" not in item:
-            raise ValueError(f"Bad qspec {item!r}, expected fmt@blk")
-        fmt, blk = item.split("@", 1)
-        fmt = fmt.strip()
-        blk = blk.strip()
-        if blk.isdigit():
-            out.append((fmt, int(blk)))
-        else:
-            out.append((fmt, blk))
+
+        if "@" in item:
+            fmt, blk = item.split("@", 1)
+            fmt = fmt.strip().lower()
+            blk = blk.strip().lower()
+            if fmt in ignore_blk_fmts:
+                out.append((fmt, "na"))
+                continue
+            if blk.isdigit():
+                out.append((fmt, int(blk)))
+            else:
+                out.append((fmt, blk))
+            continue
+
+        # No "@"
+        fmt = item.strip().lower()
+        if fmt in ignore_blk_fmts:
+            out.append((fmt, "na"))
+            continue
+        raise ValueError(f"Bad qspec {item!r}, expected fmt@blk (except nvfp4/mxfp4/mxfp6)")
     return out
 
 
@@ -472,14 +611,32 @@ def _cfg_key(rank: Optional[int], qspec: Optional[Tuple[str, Union[int, str]]]) 
     return f"rank={r};fmt={fmt};blk={blk}"
 
 
-def build_svdq_cfg_all(rank: Optional[int], qspec: Optional[Tuple[str, Union[int, str]]]) -> Dict[str, Any]:
-    cfg: Dict[str, Any] = {"svd": {}, "quant": {}}
+def build_svdq_cfg_all(
+    method: str,
+    rank: Optional[int],
+    qspec: Optional[Tuple[str, Union[int, str]]],
+) -> Dict[str, Any]:
+    """Build a minimal svdq_config that applies the same scheme to all allowlisted linears.
+
+    `method` selects the high-precision side path:
+      - "svd": low-rank SVD approximation (classic Fake SVDQ)
+      - "mpo": 2-core MPO / tensor-train approximation (rank = virtual bond dim)
+
+    The quantization is always applied to the residual R = W - W_hat (if rank is set),
+    and the reconstructed W' replaces the original weight in-place.
+    """
+    m = (method or "svd").lower().strip()
+    if m not in ("svd", "mpo"):
+        raise ValueError(f"Unknown method: {method!r} (expected 'svd' or 'mpo')")
+
+    cfg: Dict[str, Any] = {"method": m, "svd": {}, "quant": {}}
     if rank is not None:
         cfg["svd"] = {"all": int(rank)}
     if qspec is not None:
         fmt, blk = qspec
         cfg["quant"] = {"all": (fmt, blk)}
     return cfg
+
 
 
 # ----------------------------
@@ -492,6 +649,7 @@ def eval_tokenwise_fake(
     xy_path: str,
     out_json_path: str,
     *,
+    method: str = "svd",  # high-precision side path: svd | mpo
     ranks: List[int],
     qspecs: List[Tuple[str, Union[int, str]]],
     grid_mode: str = "combined",  # "combined" or "full"
@@ -503,13 +661,21 @@ def eval_tokenwise_fake(
     """Grid-search configs and evaluate tokenwise output error for each allowlisted linear.
 
     If smooth=True, X will be preprocessed by each module.smooth_factor: X' = X / smooth_factor.
+    `method` selects high-precision side path: 'svd' (low-rank SVD) or 'mpo' (2-core MPO).
     """
     model.eval()
     targets = _iter_allowed_linears(model)
     if not targets:
         raise RuntimeError("No target linears found.")
 
-    xy_tensors, xy_meta = load_tensor_dict(xy_path)
+    xy_is_dir = os.path.isdir(xy_path)
+    xy_meta: Dict[str, str] = {}
+    xy_tensors: Optional[Dict[str, torch.Tensor]] = None
+    layer_xy_files: Optional[Dict[int, str]] = None
+    if xy_is_dir:
+        layer_xy_files = _collect_layer_xy_files(xy_path)
+    else:
+        xy_tensors, xy_meta = load_tensor_dict(xy_path)
 
     # CPU backup for restoring weights between configs (optional but recommended for grid)
     cpu_backup: Dict[str, torch.Tensor] = {}
@@ -517,7 +683,11 @@ def eval_tokenwise_fake(
         for name, mod in targets.items():
             cpu_backup[name] = mod.weight.detach().to("cpu", dtype=backup_dtype).clone()
 
-    from fake_svdq import fake_op  # in-place op provided by your repo
+    try:
+        from fake_svdq_v3 import fake_op  # supports method=svd|mpo
+    except Exception:
+        from fake_svdq import fake_op  # fallback
+
 
     # Build grid
     cfg_items: List[Tuple[Optional[int], Optional[Tuple[str, Union[int, str]]]]] = []
@@ -542,7 +712,9 @@ def eval_tokenwise_fake(
         "meta": {
             "xy_path": xy_path,
             "xy_meta": xy_meta,
+            "xy_is_dir": bool(xy_is_dir),
             "grid_mode": grid_mode,
+            "method": str(method),
             "ranks": ranks,
             "qspecs": [(a, str(b)) for a, b in qspecs],
             "smooth": bool(smooth),
@@ -562,48 +734,106 @@ def eval_tokenwise_fake(
     # Evaluate
     for rank, qspec in cfg_items:
         cfg_key = _cfg_key(rank, qspec)
-        svdq_cfg = build_svdq_cfg_all(rank, qspec)
+        svdq_cfg = build_svdq_cfg_all(method, rank, qspec)
         _restore_weights()
         _ = fake_op(model, svdq_cfg)
 
         # per-module metrics
         per_layer_acc: Dict[Tuple[int, str], List[float]] = {}
 
-        for name, mod in targets.items():
-            Xk = f"{name}.X"
-            Yk = f"{name}.Y"
-            if Xk not in xy_tensors or Yk not in xy_tensors:
-                continue
-            X = xy_tensors[Xk]
-            Y = xy_tensors[Yk]
+        # compute metrics using saved X/Y
+        if xy_is_dir:
+            assert layer_xy_files is not None
+            # Group targets by layer (static for this model).
+            layer_to_mods: Dict[int, List[Tuple[str, nn.Module]]] = {}
+            for nm, md in targets.items():
+                ly, _bk, _pj = _name_to_layer_block_proj(nm)
+                layer_to_mods.setdefault(ly, []).append((nm, md))
 
-            if smooth:
-                if not hasattr(mod, "smooth_factor") or getattr(mod, "smooth_factor") is None:
-                    raise RuntimeError(f"smooth=True but {name} has no smooth_factor buffer")
-                X = _apply_smooth_to_X(X, getattr(mod, "smooth_factor"))
+            for ly in sorted(layer_to_mods.keys()):
+                fpath = layer_xy_files.get(ly)
+                if fpath is None:
+                    continue
+                with _XYLayerReader(fpath) as r:
+                    for name, mod in layer_to_mods[ly]:
+                        Xk = f"{name}.X"
+                        Yk = f"{name}.Y"
+                        if (not r.has(Xk)) or (not r.has(Yk)):
+                            continue
+                        X = r.get(Xk)
+                        Y = r.get(Yk)
 
-            W = mod.weight.detach()
-            m = tokenwise_metrics(
-                X,
-                Y,
-                W,
-                b=mod.bias,
-                device=W.device,
-                chunk_tokens=chunk_tokens,
-            )
+                        sf = None
+                        if smooth:
+                            if not hasattr(mod, "smooth_factor") or getattr(mod, "smooth_factor") is None:
+                                raise RuntimeError(f"smooth=True but {name} has no smooth_factor buffer")
+                            sf = getattr(mod, "smooth_factor")
 
-            layer, block, proj = _name_to_layer_block_proj(name)
-            layer_s = str(layer)
-            if layer_s not in results["by_layer"]:
-                results["by_layer"][layer_s] = {}
-            if block not in results["by_layer"][layer_s]:
-                results["by_layer"][layer_s][block] = {"by_proj": {}, "agg": {}}
-            by_proj = results["by_layer"][layer_s][block]["by_proj"]
-            if proj not in by_proj:
-                by_proj[proj] = {}
-            by_proj[proj][cfg_key] = m
+                        W = mod.weight.detach()
+                        m = tokenwise_metrics(
+                            X,
+                            Y,
+                            W,
+                            b=mod.bias,
+                            device=W.device,
+                            chunk_tokens=chunk_tokens,
+                            smooth_factor=sf,
+                        )
 
-            per_layer_acc.setdefault((layer, block), []).append(float(m["nmse"]))
+                        layer, block, proj = _name_to_layer_block_proj(name)
+                        layer_s = str(layer)
+                        if layer_s not in results["by_layer"]:
+                            results["by_layer"][layer_s] = {}
+                        if block not in results["by_layer"][layer_s]:
+                            results["by_layer"][layer_s][block] = {"by_proj": {}, "agg": {}}
+                        by_proj = results["by_layer"][layer_s][block]["by_proj"]
+                        if proj not in by_proj:
+                            by_proj[proj] = {}
+                        by_proj[proj][cfg_key] = m
+
+                        per_layer_acc.setdefault((layer, block), []).append(float(m["nmse"]))
+                        del X, Y
+                gc.collect()
+        else:
+            assert xy_tensors is not None
+            for name, mod in targets.items():
+                Xk = f"{name}.X"
+                Yk = f"{name}.Y"
+                if Xk not in xy_tensors or Yk not in xy_tensors:
+                    continue
+                X = xy_tensors[Xk]
+                Y = xy_tensors[Yk]
+
+                sf = None
+                if smooth:
+                    if not hasattr(mod, "smooth_factor") or getattr(mod, "smooth_factor") is None:
+                        raise RuntimeError(f"smooth=True but {name} has no smooth_factor buffer")
+                    sf = getattr(mod, "smooth_factor")
+
+                W = mod.weight.detach()
+                m = tokenwise_metrics(
+                    X,
+                    Y,
+                    W,
+                    b=mod.bias,
+                    device=W.device,
+                    chunk_tokens=chunk_tokens,
+                    smooth_factor=sf,
+                )
+
+                layer, block, proj = _name_to_layer_block_proj(name)
+                layer_s = str(layer)
+                if layer_s not in results["by_layer"]:
+                    results["by_layer"][layer_s] = {}
+                if block not in results["by_layer"][layer_s]:
+                    results["by_layer"][layer_s][block] = {"by_proj": {}, "agg": {}}
+                by_proj = results["by_layer"][layer_s][block]["by_proj"]
+                if proj not in by_proj:
+                    by_proj[proj] = {}
+                by_proj[proj][cfg_key] = m
+
+                per_layer_acc.setdefault((layer, block), []).append(float(m["nmse"]))
+
 
         # fill aggregates for this cfg
         for (layer, block), vals in per_layer_acc.items():
@@ -629,6 +859,7 @@ def eval_tokenwise_fake_smooth(
     xy_path: str,
     out_json_path: str,
     *,
+    method: str = "svd",
     ranks: List[int],
     qspecs: List[Tuple[str, Union[int, str]]],
     grid_mode: str = "combined",
@@ -640,6 +871,7 @@ def eval_tokenwise_fake_smooth(
         model,
         xy_path,
         out_json_path,
+        method=method,
         ranks=ranks,
         qspecs=qspecs,
         grid_mode=grid_mode,
@@ -706,6 +938,7 @@ def main():
     ap_eval.add_argument("--model_dir", type=str, required=True)
     ap_eval.add_argument("--xy_path", type=str, required=True)
     ap_eval.add_argument("--out_json", type=str, required=True)
+    ap_eval.add_argument("--method", type=str, default="svd", choices=["svd","mpo"], help="high-precision side path: svd or mpo")
     ap_eval.add_argument("--ranks", type=str, default="16,32")
     ap_eval.add_argument("--qspecs", type=str, default="nvfp4@128")
     ap_eval.add_argument("--grid_mode", type=str, default="combined", choices=["combined", "full"])
@@ -719,6 +952,7 @@ def main():
     ap_smt.add_argument("--smooth_model_dir", type=str, required=True)
     ap_smt.add_argument("--xy_path", type=str, required=True)
     ap_smt.add_argument("--out_json", type=str, required=True)
+    ap_smt.add_argument("--method", type=str, default="svd", choices=["svd","mpo"], help="high-precision side path: svd or mpo")
     ap_smt.add_argument("--ranks", type=str, default="16,32")
     ap_smt.add_argument("--qspecs", type=str, default="nvfp4@128")
     ap_smt.add_argument("--grid_mode", type=str, default="combined", choices=["combined", "full"])
@@ -753,6 +987,7 @@ def main():
             model,
             args.xy_path,
             args.out_json,
+            method=str(args.method),
             ranks=ranks,
             qspecs=qspecs,
             grid_mode=args.grid_mode,
@@ -767,16 +1002,8 @@ def main():
         # load smoothed model (your repo should provide it)
         try:
             from smooth_util import load_smoothed_model  # type: ignore
-
-            model = load_smoothed_model(args.smooth_model_dir)
+            model, tok = load_smoothed_model(args.smooth_model_dir, args.device_map)
             # attach tokenizer for consistency (some impl already bundles it)
-            if not hasattr(model, "tokenizer"):
-                from transformers import AutoTokenizer
-
-                tok = AutoTokenizer.from_pretrained(args.smooth_model_dir, use_fast=True, trust_remote_code=True)
-                if tok.pad_token_id is None:
-                    tok.pad_token = tok.eos_token
-                model.tokenizer = tok
         except Exception:
             # fallback: load as normal HF model
             model, _tok = _load_hf_model_tokenizer(
@@ -792,6 +1019,7 @@ def main():
             model,
             args.xy_path,
             args.out_json,
+            method=str(args.method),
             ranks=ranks,
             qspecs=qspecs,
             grid_mode=args.grid_mode,
